@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, List, Optional, Tuple
 
 import akshare as ak
@@ -40,6 +41,13 @@ def cn_code_to_ak(code: str) -> str:
     return f"sz{code}"
 
 
+def hk_code_to_ak(code: str) -> str:
+    normalized = "".join(ch for ch in code.strip() if ch.isdigit())
+    if not normalized:
+        raise ValueError("请输入有效的港股代码（如 00700）。")
+    return normalized.zfill(5)
+
+
 def to_numeric(series: pd.Series) -> pd.Series:
     cleaned = (
         series.astype(str)
@@ -57,10 +65,32 @@ def pick_col(df: pd.DataFrame, candidates: List[str]) -> str:
     raise KeyError(f"Missing required columns: {candidates}")
 
 
-def resolve_ticker_and_name(user_input: str) -> Tuple[str, str]:
+def resolve_ticker_and_name(user_input: str, market: str = "a") -> Tuple[str, str]:
     value = user_input.strip()
     if not value:
-        raise ValueError("请输入公司名称或6位股票代码。")
+        raise ValueError("请输入公司名称或股票代码。")
+
+    if market == "hk":
+        mapping = ak.stock_hk_spot()[["代码", "中文名称"]].copy()
+        mapping["代码"] = mapping["代码"].astype(str).str.zfill(5)
+        mapping["中文名称"] = mapping["中文名称"].astype(str).str.strip()
+
+        code_only = "".join(ch for ch in value if ch.isdigit())
+        if code_only and len(code_only) <= 5:
+            code = code_only.zfill(5)
+            row = mapping[mapping["代码"] == code]
+            if row.empty:
+                raise ValueError(f"未找到港股代码: {code}")
+            return code, str(row.iloc[0]["中文名称"])
+
+        exact = mapping[mapping["中文名称"] == value]
+        if not exact.empty:
+            return str(exact.iloc[0]["代码"]), str(exact.iloc[0]["中文名称"])
+
+        fuzzy = mapping[mapping["中文名称"].str.contains(value, na=False)]
+        if fuzzy.empty:
+            raise ValueError(f"未找到名称包含 '{value}' 的港股公司。")
+        return str(fuzzy.iloc[0]["代码"]), str(fuzzy.iloc[0]["中文名称"])
 
     mapping = ak.stock_info_a_code_name()
     mapping["code"] = mapping["code"].astype(str).str.zfill(6)
@@ -83,7 +113,13 @@ def resolve_ticker_and_name(user_input: str) -> Tuple[str, str]:
     return str(fuzzy.iloc[0]["code"]), str(fuzzy.iloc[0]["name"])
 
 
-def load_annual_reports(ak_code: str) -> Dict[str, pd.DataFrame]:
+def load_annual_reports(ak_code: str, market: str = "a") -> Dict[str, pd.DataFrame]:
+    if market == "hk":
+        income = ak.stock_financial_hk_report_em(stock=ak_code, symbol="利润表", indicator="年度")
+        balance = ak.stock_financial_hk_report_em(stock=ak_code, symbol="资产负债表", indicator="年度")
+        cashflow = ak.stock_financial_hk_report_em(stock=ak_code, symbol="现金流量表", indicator="年度")
+        return {"income": income, "balance": balance, "cashflow": cashflow}
+
     income = ak.stock_financial_report_sina(stock=ak_code, symbol="利润表")
     balance = ak.stock_financial_report_sina(stock=ak_code, symbol="资产负债表")
     cashflow = ak.stock_financial_report_sina(stock=ak_code, symbol="现金流量表")
@@ -106,7 +142,7 @@ def load_annual_reports(ak_code: str) -> Dict[str, pd.DataFrame]:
     return {"income": income, "balance": balance, "cashflow": cashflow}
 
 
-def build_financial_panel(reports: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_financial_panel_a(reports: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     income = reports["income"].copy()
     balance = reports["balance"].copy()
     cashflow = reports["cashflow"].copy()
@@ -147,6 +183,114 @@ def build_financial_panel(reports: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return panel
 
 
+def _hk_metric_first(df: pd.DataFrame, names: List[str]) -> pd.Series:
+    for item in names:
+        subset = df[df["STD_ITEM_NAME"] == item]
+        if not subset.empty:
+            s = subset.groupby("REPORT_DATE")["AMOUNT"].sum(min_count=1)
+            return pd.to_numeric(s, errors="coerce")
+    return pd.Series(dtype=float)
+
+
+def _parse_hk_par_value(ak_code: str) -> Optional[float]:
+    try:
+        profile = ak.stock_hk_security_profile_em(symbol=ak_code)
+        if profile.empty:
+            return None
+        raw = str(profile.iloc[0].get("每股面值", "")).strip()
+        match = re.search(r"[-+]?\d*\.?\d+", raw)
+        if not match:
+            return None
+        val = float(match.group())
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
+def build_financial_panel_hk(reports: Dict[str, pd.DataFrame], ak_code: str) -> pd.DataFrame:
+    income = reports["income"].copy()
+    balance = reports["balance"].copy()
+    cashflow = reports["cashflow"].copy()
+
+    for df in (income, balance, cashflow):
+        df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors="coerce")
+        df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
+        df.dropna(subset=["REPORT_DATE"], inplace=True)
+
+    revenue = _hk_metric_first(income, ["营业额", "营运收入", "营业收入"])
+    net_profit = _hk_metric_first(income, ["股东应占溢利", "本公司拥有人应占溢利", "除税后溢利"])
+    cfo = _hk_metric_first(cashflow, ["经营业务现金净额", "经营活动产生的现金流量净额"])
+    capex = _hk_metric_first(cashflow, ["购建固定资产"]).add(
+        _hk_metric_first(cashflow, ["购建无形资产及其他资产"]),
+        fill_value=0.0,
+    )
+
+    equity = _hk_metric_first(balance, ["股东权益", "总权益"])
+    assets = _hk_metric_first(balance, ["总资产"])
+    liabilities = _hk_metric_first(balance, ["总负债", "流动负债合计"])
+    cash = _hk_metric_first(balance, ["现金及等价物", "受限制存款及现金"])
+
+    short_debt = _hk_metric_first(balance, ["短期贷款", "短期借款"]).add(
+        _hk_metric_first(balance, ["其他金融负债(流动)"]), fill_value=0.0
+    )
+    current_lt = _hk_metric_first(balance, ["一年内到期非流动负债"])
+    long_debt = _hk_metric_first(balance, ["长期贷款", "长期借款"]).add(
+        _hk_metric_first(balance, ["其他金融负债(非流动)"]), fill_value=0.0
+    )
+    bonds = _hk_metric_first(balance, ["应付债券"])
+    lease = _hk_metric_first(balance, ["融资租赁负债(流动)"]).add(
+        _hk_metric_first(balance, ["融资租赁负债(非流动)"]), fill_value=0.0
+    )
+
+    share_capital = _hk_metric_first(balance, ["股本"])
+    par_value = _parse_hk_par_value(ak_code)
+    if par_value and par_value > 0:
+        shares = share_capital / par_value
+    else:
+        shares = share_capital
+
+    dates = sorted(revenue.dropna().index.unique())
+    if len(dates) < 5:
+        raise ValueError("港股可用年度财报不足5年，无法计算。")
+    dates = dates[-5:]
+
+    def aligned(s: pd.Series, fill_zero: bool = False) -> pd.Series:
+        out = s.reindex(dates)
+        if fill_zero:
+            return out.fillna(0.0)
+        return out.ffill().bfill()
+
+    panel = pd.DataFrame(
+        {
+            "报告日": dates,
+            "营业总收入": aligned(revenue),
+            "归母净利润": aligned(net_profit),
+            "经营现金流净额": aligned(cfo),
+            "资本开支": aligned(capex, fill_zero=True),
+            "归母股东权益": aligned(equity),
+            "资产总计": aligned(assets),
+            "负债合计": aligned(liabilities),
+            "货币资金": aligned(cash, fill_zero=True),
+            "股本": aligned(shares),
+            "短期借款": aligned(short_debt, fill_zero=True),
+            "一年内到期非流动负债": aligned(current_lt, fill_zero=True),
+            "长期借款": aligned(long_debt, fill_zero=True),
+            "应付债券": aligned(bonds, fill_zero=True),
+            "租赁负债": aligned(lease, fill_zero=True),
+        }
+    )
+
+    panel = panel.sort_values("报告日").reset_index(drop=True)
+    panel["FCFF"] = panel["经营现金流净额"] - panel["资本开支"]
+    return panel
+
+
+def build_financial_panel(reports: Dict[str, pd.DataFrame], market: str, ak_code: str) -> pd.DataFrame:
+    if market == "hk":
+        return build_financial_panel_hk(reports, ak_code)
+    return build_financial_panel_a(reports)
+
+
 def estimate_fcf_growth(panel: pd.DataFrame) -> float:
     fcff = panel["FCFF"].replace([np.inf, -np.inf], np.nan).dropna()
     if len(fcff) >= 2 and fcff.iloc[0] > 0 and fcff.iloc[-1] > 0:
@@ -183,8 +327,11 @@ def fetch_csi300_long_term_return() -> float:
     return (last_close / first_close) ** (1 / years) - 1
 
 
-def fetch_latest_price(ak_code: str) -> float:
-    spot = ak.stock_zh_a_daily(symbol=ak_code, adjust="")
+def fetch_latest_price(market: str, ak_code: str) -> float:
+    if market == "hk":
+        spot = ak.stock_hk_daily(symbol=ak_code, adjust="")
+    else:
+        spot = ak.stock_zh_a_daily(symbol=ak_code, adjust="")
     return float(to_numeric(spot["close"]).dropna().iloc[-1])
 
 
@@ -325,6 +472,7 @@ def index():
     result: Optional[Dict[str, object]] = None
 
     defaults = {
+        "market": "a",
         "query": "新易盛",
         "terminal_growth": 0.03,
         "beta": 1.4,
@@ -343,6 +491,9 @@ def index():
 
     if request.method == "POST":
         try:
+            form["market"] = request.form.get("market", form["market"]).strip().lower()
+            if form["market"] not in {"a", "hk"}:
+                form["market"] = "a"
             form["query"] = request.form.get("query", form["query"]).strip()
             form["terminal_growth"] = float(request.form.get("terminal_growth", form["terminal_growth"]))
             form["rf_rate"] = float(request.form.get("rf_rate", form["rf_rate"]))
@@ -356,14 +507,14 @@ def index():
             if form["forecast_years"] < 1:
                 raise ValueError("预测年数必须大于0。")
 
-            code, name = resolve_ticker_and_name(form["query"])
-            ak_code = cn_code_to_ak(code)
+            code, name = resolve_ticker_and_name(form["query"], form["market"])
+            ak_code = hk_code_to_ak(code) if form["market"] == "hk" else cn_code_to_ak(code)
 
-            reports = load_annual_reports(ak_code)
-            panel = build_financial_panel(reports)
+            reports = load_annual_reports(ak_code, form["market"])
+            panel = build_financial_panel(reports, form["market"], ak_code)
             latest = panel.iloc[-1]
 
-            latest_price = fetch_latest_price(ak_code)
+            latest_price = fetch_latest_price(form["market"], ak_code)
             latest_fcff = float(latest["FCFF"])
             fcff_growth = estimate_fcf_growth(panel)
 
@@ -425,8 +576,14 @@ def index():
             )
 
             result = {
-                "company": {"code": code, "name": name, "latest_price": latest_price},
+                "company": {
+                    "code": code,
+                    "name": name,
+                    "latest_price": latest_price,
+                    "market": "港股" if form["market"] == "hk" else "A股",
+                },
                 "params": {
+                    "market": form["market"],
                     "terminal_growth": form["terminal_growth"],
                     "rf_rate": form["rf_rate"],
                     "erp": form["erp"],

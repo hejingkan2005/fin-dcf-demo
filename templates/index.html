@@ -54,6 +54,24 @@
       font-size: 13px;
       color: var(--muted);
     }
+    .radio-group {
+      display: flex;
+      gap: 16px;
+      margin-top: 8px;
+      align-items: center;
+    }
+    .radio-group label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 0;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    .radio-group input {
+      width: auto;
+      margin-top: 0;
+    }
     input {
       width: 100%;
       margin-top: 6px;
@@ -191,8 +209,14 @@
     <div class="grid">
       <div class="card">
         <form method="post">
+          <label>市场</label>
+          <div class="radio-group">
+            <label><input type="radio" name="market" value="a" {% if form.market == 'a' %}checked{% endif %} /> A股</label>
+            <label><input type="radio" name="market" value="hk" {% if form.market == 'hk' %}checked{% endif %} /> 港股</label>
+          </div>
+
           <label>公司名称或Ticker</label>
-          <input name="query" value="{{ form.query }}" placeholder="例如: 新易盛 或 300502" />
+          <input name="query" value="{{ form.query }}" placeholder="例如: 新易盛 / 300502 / 腾讯控股 / 00700" />
 
           <label>永续增长率 g（默认3%）</label>
           <input name="terminal_growth" type="number" step="0.0001" value="{{ form.terminal_growth }}" />
@@ -226,6 +250,7 @@
       <div>
         {% if result %}
           <div class="card">
+            <div class="pill">市场 {{ result.company.market }}</div>
             <div class="pill">标的 {{ result.company.name }} ({{ result.company.code }})</div>
             <div class="pill">财报区间 {{ result.report_dates[0] }} ~ {{ result.report_dates[-1] }}</div>
             <div class="pill">最新收盘 {{ '%.2f'|format(result.company.latest_price) }} 元</div>
