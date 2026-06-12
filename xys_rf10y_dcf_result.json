@@ -1,0 +1,23 @@
+{
+  "code": "300502",
+  "name": "新易盛",
+  "report_dates": [
+    "2021-12-31",
+    "2022-12-31",
+    "2023-12-31",
+    "2024-12-31",
+    "2025-12-31"
+  ],
+  "wacc": 0.1072622,
+  "terminal_growth": 0.03,
+  "forecast_years": 5,
+  "assumed_fcf_growth": 0.2,
+  "latest_fcff": 6381532522.46,
+  "enterprise_value": 168067145189.66327,
+  "net_debt": -8140675068.55,
+  "equity_value": 176207820258.21326,
+  "shares_outstanding": 994009312.0,
+  "intrinsic_value_per_share": 177.26978825145378,
+  "latest_market_price": 526.0,
+  "upside_vs_market": -0.6629851934383009
+}
